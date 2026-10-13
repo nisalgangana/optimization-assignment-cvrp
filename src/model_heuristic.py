@@ -135,22 +135,33 @@ def random_move(inst: Instance, routes, rng: random.Random):
 # Stage 3 — simulated annealing
 # ---------------------------------------------------------------------------
 
-def objective(inst: Instance, routes) -> float:
-    """What SA minimises: the total distance, from common.solution_cost."""
-    return common.solution_cost(inst, routes)
+def objective(inst: Instance, routes, penalty: float) -> float:
+    """Total distance (from common.solution_cost) plus a penalty when there are
+    more routes than trucks (K).
+
+    Greedy ignores K, so on a tight instance it can use one truck too many.
+    The penalty is the load still sitting on the lightest extra route(s),
+    times a big weight. Every customer moved off that route lowers the
+    penalty a little, so SA is guided step by step towards emptying it.
+    A plan that respects K has no penalty at all."""
+    extra_routes = len(routes) - inst.n_vehicles
+    if extra_routes <= 0:
+        return common.solution_cost(inst, routes)
+    loads = sorted(common.route_load(inst, r) for r in routes)
+    return common.solution_cost(inst, routes) + penalty * sum(loads[:extra_routes])
 
 
-def initial_temperature(inst: Instance, routes, rng: random.Random,
+def initial_temperature(inst: Instance, routes, penalty: float, rng: random.Random,
                         samples: int = 100) -> float:
     """T0 = the average |delta| of about 100 random moves from the start.
     At that temperature an average worsening move is accepted with
     probability exp(-1), about 37 %, so the search starts free to explore."""
-    start = objective(inst, routes)
+    start = objective(inst, routes, penalty)
     deltas = []
     while len(deltas) < samples:
         new = random_move(inst, routes, rng)
         if new is not None:                   # skip draws that overload a truck
-            deltas.append(abs(objective(inst, new) - start))
+            deltas.append(abs(objective(inst, new, penalty) - start))
     return sum(deltas) / len(deltas)
 
 
@@ -176,12 +187,16 @@ def solve(inst: Instance, time_limit: float = 300.0, seed: int = 0, T0: float | 
     """
     start_time = time.perf_counter()
     rng = random.Random(seed)                 # fixed seed -> the run can be repeated exactly
+    penalty = float(inst.dist.max())          # per unit of load left on an extra route
 
     start_routes = greedy(inst)
-    current, current_cost = start_routes, objective(inst, start_routes)
-    best, best_cost = current, current_cost   # best plan seen so far
+    current, current_cost = start_routes, objective(inst, start_routes, penalty)
+    # best = the best plan that respects the fleet size K (None until one is seen)
+    best, best_cost = None, math.inf
+    if len(current) <= inst.n_vehicles:
+        best, best_cost = current, current_cost
 
-    T = T0 if T0 is not None else initial_temperature(inst, current, rng)
+    T = T0 if T0 is not None else initial_temperature(inst, current, penalty, rng)
     start_T = T
     if iters_per_temp is None:
         iters_per_temp = 10 * inst.n_customers  # more customers -> more moves per temperature
@@ -193,16 +208,17 @@ def solve(inst: Instance, time_limit: float = 300.0, seed: int = 0, T0: float | 
             iterations += 1
             new = random_move(inst, current, rng)
             if new is not None:
-                new_cost = objective(inst, new)
+                new_cost = objective(inst, new, penalty)
                 delta = new_cost - current_cost
                 # acceptance rule: always take a better plan, sometimes a worse one
                 if delta <= 0 or rng.random() < math.exp(-delta / T):
                     current, current_cost = new, new_cost
-                    if current_cost < best_cost:
+                    if len(current) <= inst.n_vehicles and current_cost < best_cost:
                         best, best_cost = current, current_cost
             history.append(best_cost)
         T *= alpha                            # geometric cooling
 
+    assert best is not None, "SA never found a plan that fits in K trucks"
     ok, why = common.is_feasible(inst, best)
     assert ok, f"SA returned an infeasible solution: {why}"
     return Solution(
