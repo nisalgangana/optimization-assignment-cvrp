@@ -79,8 +79,26 @@ python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\ac
 pip install -r requirements.txt
 ```
 
-CBC is bundled with PuLP, so no separate solver install is needed. The
-instances are already in `data/instances/`; to download them again:
+`requirements.txt` installs PuLP 4 together with the CBC solver
+(`pulp[cbc]`). PuLP 4 no longer ships CBC on its own, and its API differs from
+PuLP 2.x, so an older PuLP will not run `src/model_milp.py`.
+
+**macOS on Apple Silicon:** the `cbcbox` package ships three libraries with
+broken code signatures, and macOS stops CBC as soon as it starts (exit code
+137). Re-sign them once after installing (adjust `python3.14` to your Python
+version):
+
+```bash
+codesign --force --sign - .venv/lib/python3.14/site-packages/cbcbox/cbc_dist/lib/{libgcc_s.1.1.dylib,libgfortran.5.dylib,libquadmath.0.dylib}
+```
+
+Check that the solver is available (the list should contain `COIN_CMD`):
+
+```bash
+python -c "import pulp; print(pulp.listSolvers(onlyAvailable=True))"
+```
+
+The instances are already in `data/instances/`; to download them again:
 
 ```bash
 python src/download_instances.py
@@ -105,8 +123,22 @@ bound, so the optimality gap can be reported when it times out.
 
 ## Results
 
-To be added once the experiments are run (`results/results.csv` and the
-figures in `results/`).
+### Exact method (MTZ MILP, CBC)
+
+Run one instance with `python src/model_milp.py <instance.vrp> <time_limit>`.
+
+| Instance | n | Time limit | Status | Cost | Optimum | Gap to optimum | Lower bound | Runtime |
+|---|---|---|---|---|---|---|---|---|
+| P-n16-k8 | 15 | 120 s | optimal | 450 | 450 | 0.00% | 450.0 | 65.9 s |
+| E-n22-k4 | 21 | 600 s | timeout | 466 | 375 | 24.27% | 261.3 | 600.7 s |
+| A-n32-k5 | 31 | 600 s | timeout | 1144 | 784 | 45.92% | 424.0 | 601.4 s |
+
+The MILP proves the optimum only on the smallest instance. On the larger ones
+the lower bound stays far below the optimum (70% and 54% of it), so branch and
+bound cannot prune the tree and the time limit is reached first.
+
+The comparison with the heuristic (`results/results.csv` and the figures in
+`results/`) will be added once both methods have been run.
 
 ## References
 
