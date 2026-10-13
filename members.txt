@@ -3,9 +3,9 @@ Group Members - Optimization Methods (IT5082)
 Index No    : MS26910222
 Name        : Nisal Gangana
 Email       : ms26910222@mysliit.lk
-Role        : Exact method (MILP), data loader, evaluation harness
+Role        : Exact method (MILP), data loader
 
-Index No    : 
+Index No    : MS26901626
 Name        : Ayesh Lakshan
-Email       : 
-Role        : Heuristic method (Greedy + Local Search + Simulated Annealing), visualizations
+Email       : ms2691626@mysliit.lk
+Role        : Heuristic method (Greedy + Local Search + Simulated Annealing), Evaluation harness, Visualizations
