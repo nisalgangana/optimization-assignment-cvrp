@@ -36,6 +36,35 @@ def build_model(inst: Instance):
     #total distance travelled (objective)
     prob += pulp.lpSum(int(inst.dist[i,j]) * x[i,j] for (i,j) in arcs)
 
+    Q = inst.capacity          # vehicle capacity
+    K = inst.n_vehicles        # fleet size
+    q = inst.demand            # q[i] = demand of node i
+
+    # C1: customer i has exactly one incoming arc (from depot or another customer)
+    for j in customers:
+        prob += pulp.lpSum(x[i, j] for i in nodes if i != j) == 1, f"C1_in_{j}"
+
+    # C2: customer i has exactly one outgoing arc (to depot or another customer)
+    for i in customers:
+        prob += pulp.lpSum(x[i, j] for j in nodes if j != i) == 1, f"C2_out_{i}"
+
+    # C3: at most K vehicles leave the depot, and all of them return
+    leave = pulp.lpSum(x[0, j] for j in customers)
+    enter = pulp.lpSum(x[i, 0] for i in customers)
+    prob += leave <= K, "C3_fleet"
+    prob += enter == leave, "C3_balance"
+
+    # C4 (MTZ): load increases along every arc between customers
+    for i in customers:
+        for j in customers:
+            if i != j:
+                prob += u[j] >= u[i] + int(q[j]) - Q * (1 - x[i, j]), f"C4_mtz_{i}_{j}"
+
+    # C5: load bounds
+    for i in customers:
+        prob += u[i] >= int(q[i]), f"C5_lo_{i}"
+        prob += u[i] <= Q, f"C5_hi_{i}"
+
     return prob, x, u
     
 
