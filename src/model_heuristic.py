@@ -61,6 +61,76 @@ def greedy(inst: Instance) -> list[list[int]]:
     return routes
 
 
+# ---------------------------------------------------------------------------
+# Stage 2 — neighbourhood moves
+# Each move is a small pure function: it never changes the routes it is given,
+# it returns a NEW list of routes, or None when the move would overload a truck.
+# ---------------------------------------------------------------------------
+
+def relocate(inst: Instance, routes, r1: int, i: int, r2: int, j: int):
+    """Take the customer at position i of route r1 and insert it at position j
+    of route r2 (r2 may be the same route). Only the receiving route gains
+    load, so only that route needs a capacity check."""
+    new = [list(r) for r in routes]
+    customer = new[r1].pop(i)
+    new[r2].insert(j, customer)
+    if r1 != r2 and common.route_load(inst, new[r2]) > inst.capacity:
+        return None
+    return [r for r in new if r]              # a route that became empty is closed
+
+
+def swap(inst: Instance, routes, r1: int, i: int, r2: int, j: int):
+    """Exchange customer i of route r1 with customer j of route r2 (two
+    different routes). Both routes change load, so both are checked."""
+    if r1 == r2:
+        return None
+    new = [list(r) for r in routes]
+    new[r1][i], new[r2][j] = new[r2][j], new[r1][i]
+    if (common.route_load(inst, new[r1]) > inst.capacity
+            or common.route_load(inst, new[r2]) > inst.capacity):
+        return None
+    return new
+
+
+def two_opt(inst: Instance, routes, r: int, i: int, j: int):
+    """Reverse the part of route r between positions i and j (i < j). This
+    removes a place where the route crosses itself. The same customers stay on
+    the route, so the load does not change and it is always feasible."""
+    new = [list(rt) for rt in routes]
+    new[r][i:j + 1] = reversed(new[r][i:j + 1])
+    return new
+
+
+def random_move(inst: Instance, routes, rng: random.Random):
+    """Pick one of the three moves at random, with random positions.
+    Returns the new routes, or None if the draw was infeasible or did nothing."""
+    move = rng.choice(("relocate", "swap", "two_opt"))
+    r1 = rng.randrange(len(routes))
+    i = rng.randrange(len(routes[r1]))
+
+    if move == "relocate":
+        r2 = rng.randrange(len(routes))
+        # after removing the customer, route r1 is one shorter
+        size = len(routes[r2]) - 1 if r2 == r1 else len(routes[r2])
+        j = rng.randint(0, size)
+        if r1 == r2 and i == j:
+            return None                       # put back in the same place
+        return relocate(inst, routes, r1, i, r2, j)
+
+    if move == "swap":
+        if len(routes) < 2:
+            return None
+        r2 = rng.randrange(len(routes))
+        j = rng.randrange(len(routes[r2]))
+        return swap(inst, routes, r1, i, r2, j)
+
+    # two_opt needs at least two customers on the route
+    if len(routes[r1]) < 2:
+        return None
+    a, b = sorted(rng.sample(range(len(routes[r1])), 2))
+    return two_opt(inst, routes, r1, a, b)
+
+
 if __name__ == "__main__":
     from loader import load_cvrplib
 
