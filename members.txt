@@ -7,5 +7,5 @@ Role        : Exact method (MILP), data loader
 
 Index No    : MS26901626
 Name        : Ayesh Lakshan
-Email       : ms2691626@mysliit.lk
+Email       : ms26901626@mysliit.lk
 Role        : Heuristic method (Greedy + Local Search + Simulated Annealing), Evaluation harness, Visualizations
