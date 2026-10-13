@@ -13,6 +13,9 @@ import sys
 import time
 from pathlib import Path
 
+import re
+import tempfile
+
 import pulp
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -67,5 +70,71 @@ def build_model(inst: Instance):
 
     return prob, x, u
     
+def _read_lower_bound(log_path):
+    """CBC writes 'Lower bound: <value>' near the end of its log."""
+    try:
+        text = Path(log_path).read_text()
+    except OSError:
+        return None
+    m = re.search(r"Lower bound:\s*([-+\d.eE]+)", text)
+    return float(m.group(1)) if m else None
+
+
+def _extract_routes(inst, x):
+    """Follow the arcs with x = 1, starting from every arc that leaves the depot."""
+    succ = {i: j for (i, j), var in x.items() if i != 0 and var.value() > 0.5}
+    routes = []
+    for j in inst.customers:
+        if x[0, j].value() > 0.5:
+            route = [j]
+            while succ[route[-1]] != 0:
+                route.append(succ[route[-1]])
+            routes.append(route)
+    return routes
+
+
+def solve(inst: Instance, time_limit: float = 300.0, seed: int = 0, **kw) -> Solution:
+    prob, x, u = build_model(inst)
+
+    # solve with CBC; the log goes to a temporary file so the bound can be read
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = str(Path(tmp) / "cbc.log")
+        solver = pulp.COIN_CMD(msg=False, timeLimit=time_limit,
+                               randomSeed=seed, logPath=log_path)
+        t0 = time.perf_counter()
+        stats = prob.solve(solver)
+        runtime = time.perf_counter() - t0
+        bound = stats.best_bound
+        if bound is None:
+            bound = _read_lower_bound(log_path)
+
+    # map the solver result to our status names
+    S = pulp.LpSolveStatus
+    if stats.status == S.Optimal:
+        status = "optimal"
+    elif stats.status == S.Infeasible:
+        status = "infeasible"
+    elif stats.status == S.TimeLimit:
+        status = "timeout"
+    else:
+        status = "feasible" if stats.has_solution else "infeasible"
+
+    # no solution found (e.g. time ran out before the first route set)
+    if not stats.has_solution:
+        return Solution(routes=[], cost=float("inf"), runtime=runtime,
+                        method="milp", status=status, bound=bound,
+                        extra={"seed": seed, "time_limit": time_limit})
+
+    routes = _extract_routes(inst, x)
+    cost = common.solution_cost(inst, routes)
+    ok, why = common.is_feasible(inst, routes)
+    assert ok, f"MILP returned an infeasible solution: {why}"
+    if status == "optimal":
+        bound = cost  # optimum proved, so the bound equals the cost
+
+    return Solution(routes=routes, cost=cost, runtime=runtime, method="milp",
+                    status=status, bound=bound,
+                    extra={"seed": seed, "time_limit": time_limit,
+                           "solver_status": stats.status.name})
 
 
