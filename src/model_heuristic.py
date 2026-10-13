@@ -131,6 +131,92 @@ def random_move(inst: Instance, routes, rng: random.Random):
     return two_opt(inst, routes, r1, a, b)
 
 
+# ---------------------------------------------------------------------------
+# Stage 3 — simulated annealing
+# ---------------------------------------------------------------------------
+
+def objective(inst: Instance, routes) -> float:
+    """What SA minimises: the total distance, from common.solution_cost."""
+    return common.solution_cost(inst, routes)
+
+
+def initial_temperature(inst: Instance, routes, rng: random.Random,
+                        samples: int = 100) -> float:
+    """T0 = the average |delta| of about 100 random moves from the start.
+    At that temperature an average worsening move is accepted with
+    probability exp(-1), about 37 %, so the search starts free to explore."""
+    start = objective(inst, routes)
+    deltas = []
+    while len(deltas) < samples:
+        new = random_move(inst, routes, rng)
+        if new is not None:                   # skip draws that overload a truck
+            deltas.append(abs(objective(inst, new) - start))
+    return sum(deltas) / len(deltas)
+
+
+def solve(inst: Instance, time_limit: float = 300.0, seed: int = 0, T0: float | None = None,
+          alpha: float = 0.995, iters_per_temp: int | None = None,
+          T_min: float = 0.01, **kw) -> Solution:
+    """Simulated annealing, starting from the greedy routes.
+
+    Each step: try one random move. If it makes the plan shorter, accept it.
+    If it makes the plan longer by delta, still accept it with probability
+    exp(-delta / T). Accepting some worse moves is what lets SA climb out of a
+    local optimum, where every single move makes things worse.
+
+    T (the temperature) controls how often worse moves are accepted. It starts
+    at T0 (high: explore) and is multiplied by alpha after every
+    iters_per_temp steps (geometric cooling), so the search slowly becomes
+    pickier and finally behaves like plain local search. Too fast cooling
+    freezes in a poor solution; too slow cooling wastes time.
+
+    Stops when T < T_min or when time_limit seconds have passed. The best
+    plan ever seen is kept separately from the current one, because the
+    current one is allowed to get worse.
+    """
+    start_time = time.perf_counter()
+    rng = random.Random(seed)                 # fixed seed -> the run can be repeated exactly
+
+    start_routes = greedy(inst)
+    current, current_cost = start_routes, objective(inst, start_routes)
+    best, best_cost = current, current_cost   # best plan seen so far
+
+    T = T0 if T0 is not None else initial_temperature(inst, current, rng)
+    start_T = T
+    if iters_per_temp is None:
+        iters_per_temp = 10 * inst.n_customers  # more customers -> more moves per temperature
+
+    history = []                              # best cost after every iteration
+    iterations = 0
+    while T > T_min and time.perf_counter() - start_time < time_limit:
+        for _ in range(iters_per_temp):
+            iterations += 1
+            new = random_move(inst, current, rng)
+            if new is not None:
+                new_cost = objective(inst, new)
+                delta = new_cost - current_cost
+                # acceptance rule: always take a better plan, sometimes a worse one
+                if delta <= 0 or rng.random() < math.exp(-delta / T):
+                    current, current_cost = new, new_cost
+                    if current_cost < best_cost:
+                        best, best_cost = current, current_cost
+            history.append(best_cost)
+        T *= alpha                            # geometric cooling
+
+    ok, why = common.is_feasible(inst, best)
+    assert ok, f"SA returned an infeasible solution: {why}"
+    return Solution(
+        routes=best,
+        cost=common.solution_cost(inst, best),
+        runtime=time.perf_counter() - start_time,
+        method="sa",
+        status="feasible",
+        extra={"seed": seed, "T0": start_T, "alpha": alpha, "iters_per_temp": iters_per_temp,
+               "iterations": iterations, "greedy_cost": common.solution_cost(inst, start_routes),
+               "history": history},
+    )
+
+
 if __name__ == "__main__":
     from loader import load_cvrplib
 
@@ -139,5 +225,8 @@ if __name__ == "__main__":
 
     routes = greedy(inst)
     print("Greedy:", common.solution_cost(inst, routes), "|", common.is_feasible(inst, routes))
-    for k, route in enumerate(routes, 1):
-        print(f"  route {k}: {route}  load {common.route_load(inst, route)}/{inst.capacity}")
+
+    sol = solve(inst, seed=0)
+    print(common.describe(inst, sol))
+    print(f"T0={sol.extra['T0']:.1f}  iterations={sol.extra['iterations']:,}  "
+          f"greedy={sol.extra['greedy_cost']:.0f}")
