@@ -136,3 +136,11 @@ def solve(inst: Instance, time_limit: float = 300.0, seed: int = 0, **kw) -> Sol
                            "solver_status": stats.status.name})
 
 
+if __name__ == "__main__": #solve a CVRP instance from the command line
+    path = sys.argv[1] if len(sys.argv) > 1 else "data/instances/P-n16-k8.vrp"
+    limit = float(sys.argv[2]) if len(sys.argv) > 2 else 120.0 #time limit in seconds
+    inst = load_cvrplib(path) #load the CVRP instance from the given path
+    sol = solve(inst, time_limit=limit) 
+    print(common.describe(inst, sol))
+    print(f"  lower bound = {sol.bound}") 
+
