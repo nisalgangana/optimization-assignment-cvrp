@@ -16,7 +16,7 @@ GitHub repository
   Final version: tag "submission" on branch main
 
 YouTube video
-  <ADD YOUTUBE LINK HERE>
+  https://youtu.be/9Xr_V-Yzy7M
 
 Report: CVRP_Report.pdf
 Setup and how to run: see README.md
