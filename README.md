@@ -61,10 +61,15 @@ src/
   model_milp.py         exact method (MTZ MILP)
   model_heuristic.py    greedy construction + simulated annealing
   evaluate.py           runs both methods on all instances, writes results/results.csv
+  plots.py              all figures (route maps, cost, gap, runtime, convergence)
+  tuning.py             SA parameter study (cooling rate, start temperature)
 notebooks/
   main.ipynb            data, exact method and final comparison
   heuristic_method.ipynb heuristic experiments and convergence
-results/                results.csv and figures
+results/
+  results.csv           one row per run (MILP once, SA with 5 seeds)
+  tuning.csv            SA tuning runs
+  figures/              all figures used in the notebooks and the report
 members.txt  submission.txt  code_appendix.txt  CONTRIBUTIONS.md
 ```
 
@@ -110,6 +115,21 @@ Check that the loader works:
 python src/loader.py data/instances/P-n16-k8.vrp
 ```
 
+## Running
+
+```bash
+python src/model_milp.py data/instances/P-n16-k8.vrp 120   # MILP on one instance (about 1 min)
+python src/model_heuristic.py data/instances/P-n16-k8.vrp  # greedy + SA on one instance
+python src/evaluate.py --quick   # short test on P-n16-k8 -> results/results_quick.csv
+python src/evaluate.py --full    # all experiments -> results/results.csv (about 75 min, the MILP has a 600 s limit per instance)
+python src/plots.py              # redraw the figures from results/results.csv
+python src/tuning.py             # SA parameter study -> results/tuning.csv
+```
+
+`notebooks/main.ipynb` reads `results/results.csv`, so it runs in about a
+minute without repeating the long experiments. Open it with the `.venv` kernel
+and use Restart and Run All.
+
 ## Design notes
 
 Both solvers take an `Instance` and return a `Solution` (`src/common.py`).
@@ -123,22 +143,48 @@ bound, so the optimality gap can be reported when it times out.
 
 ## Results
 
-### Exact method (MTZ MILP, CBC)
+All numbers come from `results/results.csv` (`python src/evaluate.py --full`).
+The MILP ran once with a 600 s limit. SA ran with 5 seeds, and the table shows
+the best and the mean of those runs.
 
-Run one instance with `python src/model_milp.py <instance.vrp> <time_limit>`.
+### Benchmark instances
 
-| Instance | n | Time limit | Status | Cost | Optimum | Gap to optimum | Lower bound | Runtime |
+| Instance | n | Optimum | MILP cost | MILP status | MILP time | SA best | SA mean (gap) | SA time |
 |---|---|---|---|---|---|---|---|---|
-| P-n16-k8 | 15 | 120 s | optimal | 450 | 450 | 0.00% | 450.0 | 65.9 s |
-| E-n22-k4 | 21 | 600 s | timeout | 466 | 375 | 24.27% | 261.3 | 600.7 s |
-| A-n32-k5 | 31 | 600 s | timeout | 1144 | 784 | 45.92% | 424.0 | 601.4 s |
+| P-n16-k8 | 15 | 450 | 450 | optimal | 68.9 s | 450 | 450.0 (0.00%) | 0.5 s |
+| E-n22-k4 | 21 | 375 | 466 | timeout | 600 s | 375 | 379.6 (1.23%) | 0.9 s |
+| A-n32-k5 | 31 | 784 | 1144 | timeout | 600 s | 784 | 801.8 (2.27%) | 2.0 s |
+| A-n45-k6 | 44 | 944 | 1557 | timeout | 600 s | 1009 | 1075.8 (13.96%) | 3.1 s |
+| A-n80-k10 | 79 | 1763 | no solution | timeout | 600 s | 1835 | 1852.4 (5.07%) | 7.7 s |
 
-The MILP proves the optimum only on the smallest instance. On the larger ones
-the lower bound stays far below the optimum (70% and 54% of it), so branch and
-bound cannot prune the tree and the time limit is reached first.
+### Synthetic instances (scalability study)
 
-The comparison with the heuristic (`results/results.csv` and the figures in
-`results/`) will be added once both methods have been run.
+No published optimum, so the MILP lower bound is shown instead.
+
+| Instance | n | MILP cost | MILP status | MILP lower bound | SA best | SA mean | SA time |
+|---|---|---|---|---|---|---|---|
+| synth-n10-k2-s0 | 10 | 365 | optimal | 365.0 | 365 | 365.0 | 0.4 s |
+| synth-n20-k3-s0 | 20 | 542 | timeout | 426.0 | 530 | 534.8 | 1.1 s |
+| synth-n40-k7-s0 | 40 | 1213 | timeout | 515.8 | 843 | 858.8 | 2.4 s |
+| synth-n80-k14-s0 | 80 | 2223 | timeout | 659.2 | 1453 | 1490.6 | 7.3 s |
+
+### Main findings
+
+- The MILP proves the optimum only for 10 and 15 customers. From 20 customers
+  on it always hits the time limit, and on A-n80-k10 it finds no feasible
+  solution at all.
+- The reason is the weak LP relaxation of the MTZ model. The lower bound reaches
+  only 70% of the optimum on E-n22-k4 and 54% on A-n32-k5, so branch and bound
+  cannot prune the tree.
+- SA finds the exact optimum on P-n16-k8, E-n22-k4 and A-n32-k5, and its mean
+  gap stays within about 5% except on A-n45-k6 (14%), the instance with the
+  tightest capacity. It never takes more than 8 seconds.
+- For SA, a cooling rate of 0.995 was chosen as a trade-off: 0.999 gives better
+  routes on A-n32-k5 but takes about 5 times longer (`results/tuning.csv`).
+
+Figures are in `results/figures/`: `cost_comparison.png`, `gap_vs_n.png`,
+`runtime_vs_n.png`, `sa_convergence.png`, `tuning.png` and route maps
+(`routes_*.png`).
 
 ## References
 
