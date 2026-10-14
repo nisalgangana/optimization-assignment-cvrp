@@ -70,6 +70,6 @@ I worked on the heuristic method, the experiments and the figures.
 - `notebooks/heuristic_method.ipynb`: SA on three instances with the
   convergence plot and a route map.
 - Report sections 5 to 7 (heuristic method, results, discussion and future
-  work), and video minutes 7:30 to 15:00.
+  work), and the heuristic part of the video (second half).
 
 Pull requests: #5, #6.
