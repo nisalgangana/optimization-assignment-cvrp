@@ -1,0 +1,1101 @@
+IT5082 Optimization Methods - Programming Assignment
+Code appendix: source files in src/
+Repository: https://github.com/nisalgangana/optimization-assignment-cvrp
+
+================================================================================
+src/common.py
+================================================================================
+"""
+common.py — shared data structures for every solver in this project.
+
+Both the exact MILP (model_milp.py) and the heuristic (model_heuristic.py)
+read an `Instance` and return a `Solution`. Keeping the cost and feasibility
+checks HERE (and nowhere else) guarantees both methods are compared on
+exactly the same numbers.
+
+Node convention used everywhere in this repo:
+    node 0           = depot
+    nodes 1 .. n     = customers
+A solution is a list of routes; each route is a list of customer ids
+(depot NOT included — it is implied at the start and end of every route).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+import numpy as np
+
+
+@dataclass
+class Instance:
+    name: str
+    coords: np.ndarray          # shape (n+1, 2); row 0 is the depot
+    demand: np.ndarray          # shape (n+1,);   demand[0] == 0
+    capacity: int               # vehicle capacity Q
+    n_vehicles: int             # fleet size K (upper bound on routes used)
+    dist: np.ndarray            # shape (n+1, n+1) integer distance matrix
+    optimum: Optional[int] = None   # published optimal cost, if known
+
+    @property
+    def n_customers(self) -> int:
+        return len(self.demand) - 1
+
+    @property
+    def customers(self) -> range:
+        return range(1, self.n_customers + 1)
+
+
+@dataclass
+class Solution:
+    routes: List[List[int]]     # e.g. [[3, 7, 1], [5, 2], ...]
+    cost: float                 # total distance, always from solution_cost()
+    runtime: float              # wall-clock seconds the solver took
+    method: str                 # "milp", "greedy", "sa", ...
+    status: str                 # "optimal" | "feasible" | "timeout" | "infeasible"
+    bound: Optional[float] = None   # best lower bound (MILP only)
+    extra: dict = field(default_factory=dict)  # anything else (seed, iterations...)
+
+    def gap_to(self, reference: Optional[float]) -> Optional[float]:
+        """Percentage gap of this solution above a reference cost."""
+        if reference is None or reference == 0:
+            return None
+        return 100.0 * (self.cost - reference) / reference
+
+
+# ---------------------------------------------------------------------------
+# The two functions every solver must rely on
+# ---------------------------------------------------------------------------
+
+def route_cost(inst: Instance, route: List[int]) -> float:
+    """Distance of depot -> route[0] -> ... -> route[-1] -> depot."""
+    if not route:
+        return 0.0
+    total = inst.dist[0, route[0]] + inst.dist[route[-1], 0]
+    for a, b in zip(route[:-1], route[1:]):
+        total += inst.dist[a, b]
+    return float(total)
+
+
+def solution_cost(inst: Instance, routes: List[List[int]]) -> float:
+    return sum(route_cost(inst, r) for r in routes)
+
+
+def route_load(inst: Instance, route: List[int]) -> int:
+    return int(sum(inst.demand[c] for c in route))
+
+
+def is_feasible(inst: Instance, routes: List[List[int]]) -> tuple[bool, str]:
+    """
+    A solution is feasible when:
+      1. every customer is visited exactly once,
+      2. no route exceeds vehicle capacity,
+      3. no more than K routes are used.
+    Returns (ok, reason) so callers can print why something failed.
+    """
+    visited = [c for r in routes for c in r]
+    if sorted(visited) != list(inst.customers):
+        missing = set(inst.customers) - set(visited)
+        dupes = {c for c in visited if visited.count(c) > 1}
+        return False, f"customer coverage wrong (missing={missing}, duplicated={dupes})"
+    for i, r in enumerate(routes):
+        if route_load(inst, r) > inst.capacity:
+            return False, f"route {i} load {route_load(inst, r)} > capacity {inst.capacity}"
+    if len([r for r in routes if r]) > inst.n_vehicles:
+        return False, f"{len(routes)} routes used but only {inst.n_vehicles} vehicles"
+    return True, "ok"
+
+
+def describe(inst: Instance, sol: Solution) -> str:
+    ok, why = is_feasible(inst, sol.routes)
+    lines = [
+        f"{inst.name}  method={sol.method}  status={sol.status}",
+        f"  cost={sol.cost:.0f}  optimum={inst.optimum}  "
+        f"gap={sol.gap_to(inst.optimum):.2f}%" if inst.optimum else f"  cost={sol.cost:.0f}",
+        f"  runtime={sol.runtime:.2f}s  feasible={ok} ({why})",
+    ]
+    for i, r in enumerate(sol.routes):
+        lines.append(f"  route {i}: 0 -> {' -> '.join(map(str, r))} -> 0  "
+                     f"(load {route_load(inst, r)}/{inst.capacity}, dist {route_cost(inst, r):.0f})")
+    return "\n".join(lines)
+
+================================================================================
+src/loader.py
+================================================================================
+"""
+loader.py — read CVRPLIB `.vrp` files and generate synthetic instances.
+
+CVRPLIB format (Augerat et al.) looks like:
+
+    NAME : A-n32-k5
+    COMMENT : (Augerat et al, No of trucks: 5, Optimal value: 784)
+    TYPE : CVRP
+    DIMENSION : 32
+    EDGE_WEIGHT_TYPE : EUC_2D
+    CAPACITY : 100
+    NODE_COORD_SECTION
+     1 82 76
+     2 96 44
+     ...
+    DEMAND_SECTION
+    1 0
+    2 19
+    ...
+    DEPOT_SECTION
+     1
+    -1
+    EOF
+
+Nodes are 1-based in the file; we re-index so the depot is 0 and customers
+are 1..n, which is what common.py expects. Distances are Euclidean rounded
+to the nearest integer (the EUC_2D convention the published optima use —
+if you don't round, your MILP will "beat" the official optimum and that is
+a bug, not a discovery).
+
+Usage:
+    python src/loader.py data/instances/P-n16-k8.vrp
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+from common import Instance  # noqa: E402
+
+
+def euclidean_matrix(coords: np.ndarray, rounded: bool = True) -> np.ndarray:
+    diff = coords[:, None, :] - coords[None, :, :]
+    d = np.sqrt((diff ** 2).sum(axis=2))
+    return np.rint(d).astype(int) if rounded else d
+
+
+def load_cvrplib(path: str | Path) -> Instance:
+    text = Path(path).read_text()
+    header, body = {}, text
+
+    # --- header lines are "KEY : value" until the first *_SECTION
+    for line in text.splitlines():
+        if "_SECTION" in line:
+            break
+        if ":" in line:
+            k, v = line.split(":", 1)
+            header[k.strip().upper()] = v.strip()
+
+    name = header.get("NAME", Path(path).stem)
+    dim = int(header["DIMENSION"])
+    capacity = int(header["CAPACITY"])
+    if header.get("EDGE_WEIGHT_TYPE", "EUC_2D") != "EUC_2D":
+        raise ValueError(f"{name}: only EUC_2D instances are supported")
+
+    # --- number of trucks: from name "...-kK" or from the comment
+    m = re.search(r"-k(\d+)", name) or re.search(r"trucks:\s*(\d+)", header.get("COMMENT", ""))
+    n_vehicles = int(m.group(1)) if m else dim  # fall back: unlimited fleet
+
+    # --- published optimum, if the comment carries one
+    m = re.search(r"Optimal value:\s*(\d+)", header.get("COMMENT", ""))
+    optimum = int(m.group(1)) if m else None
+
+    def section(tag: str) -> list[str]:
+        start = body.index(tag) + len(tag)
+        end = min([i for i in (body.find(s, start) for s in
+                   ("NODE_COORD_SECTION", "DEMAND_SECTION", "DEPOT_SECTION", "EOF"))
+                   if i != -1] or [len(body)])
+        return [l for l in body[start:end].strip().splitlines() if l.strip()]
+
+    coords = np.zeros((dim, 2))
+    for line in section("NODE_COORD_SECTION"):
+        i, x, y = line.split()[:3]
+        coords[int(i) - 1] = (float(x), float(y))
+
+    demand = np.zeros(dim, dtype=int)
+    for line in section("DEMAND_SECTION"):
+        i, q = line.split()[:2]
+        demand[int(i) - 1] = int(q)
+
+    depot_idx = int(section("DEPOT_SECTION")[0]) - 1
+    if depot_idx != 0:  # move depot to row 0 so common.py's convention holds
+        order = [depot_idx] + [i for i in range(dim) if i != depot_idx]
+        coords, demand = coords[order], demand[order]
+
+    return Instance(
+        name=name, coords=coords, demand=demand, capacity=capacity,
+        n_vehicles=n_vehicles, dist=euclidean_matrix(coords), optimum=optimum,
+    )
+
+
+def generate_synthetic(n_customers: int, seed: int = 0, capacity: int = 100,
+                       area: int = 100, demand_range=(1, 25)) -> Instance:
+    """
+    Synthetic instance for the scalability study.
+    Realism justification (put this in the report): customers uniformly
+    spread over a square service area with the depot at the centre, integer
+    demands in a bounded range, and a fleet sized at ceil(1.2 * total/Q) —
+    the same structure Augerat's benchmark instances follow.
+    """
+    rng = np.random.default_rng(seed)
+    coords = rng.uniform(0, area, size=(n_customers + 1, 2))
+    coords[0] = (area / 2, area / 2)
+    demand = rng.integers(demand_range[0], demand_range[1] + 1, size=n_customers + 1)
+    demand[0] = 0
+    k = int(np.ceil(1.2 * demand.sum() / capacity))
+    return Instance(
+        name=f"synth-n{n_customers}-k{k}-s{seed}", coords=coords, demand=demand,
+        capacity=capacity, n_vehicles=k, dist=euclidean_matrix(coords), optimum=None,
+    )
+
+
+if __name__ == "__main__":
+    inst = load_cvrplib(sys.argv[1] if len(sys.argv) > 1 else "data/instances/P-n16-k8.vrp")
+    print(f"{inst.name}: {inst.n_customers} customers, K={inst.n_vehicles}, "
+          f"Q={inst.capacity}, total demand={inst.demand.sum()}, optimum={inst.optimum}")
+    print("depot at", inst.coords[0], "| first customer demand", inst.demand[1])
+    print("dist[0,1] =", inst.dist[0, 1], "| matrix shape", inst.dist.shape)
+
+================================================================================
+src/download_instances.py
+================================================================================
+"""
+download_instances.py — fetch the CVRPLIB benchmark instances used in this project.
+
+Source: CVRPLIB (https://galgos.inf.puc-rio.br/cvrplib), Augerat et al. (1995)
+sets A and P, and Christofides & Eilon (1969) set E. Every instance has a
+published optimal cost, which we use as the reference for gap calculations.
+
+CVRPLIB serves each instance by a numeric id rather than by file name, so the
+table below maps name -> id. The old vrp.atd-lab.inf.puc-rio.br URLs no longer
+work (they redirect and then 404).
+
+Usage:
+    python src/download_instances.py
+
+If the site is unreachable, download the files by hand from the URLs printed
+below and drop them into data/instances/<name>.vrp — the loader only needs
+the .vrp text.
+"""
+
+import io
+import sys
+import zipfile
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+BASE = "https://galgos.inf.puc-rio.br/cvrplib/index.php/en/download/instance"
+
+# (name, CVRPLIB id, published optimum) — small ones for the exact method,
+# larger ones to show where it stops scaling.
+INSTANCES = [
+    ("P-n16-k8", 75, 450),
+    ("E-n22-k4", 55, 375),
+    ("A-n32-k5", 4, 784),
+    ("A-n45-k6", 16, 944),
+    ("A-n80-k10", 31, 1763),
+]
+
+
+def fetch(url: str) -> bytes:
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0 (cvrp-assignment)"})
+    with urlopen(req, timeout=60) as r:
+        return r.read()
+
+
+def to_vrp_text(raw: bytes, name: str) -> str:
+    """The server may answer with the .vrp text or with a zip holding it."""
+    if raw[:2] == b"PK":  # zip signature
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            member = next(m for m in z.namelist() if m.endswith(".vrp"))
+            raw = z.read(member)
+    text = raw.decode("utf-8", errors="replace")
+    if "NODE_COORD_SECTION" not in text:
+        raise ValueError(f"{name}: response is not a CVRPLIB .vrp file "
+                         f"(starts with: {text[:80]!r})")
+    return text
+
+
+if __name__ == "__main__":
+    out = Path("data/instances")
+    out.mkdir(parents=True, exist_ok=True)
+    failed = []
+    for name, iid, opt in INSTANCES:
+        dest = out / f"{name}.vrp"
+        if dest.exists():
+            print(f"skip {name} (exists)")
+            continue
+        url = f"{BASE}/{iid}"
+        print(f"downloading {name} <- {url}")
+        try:
+            dest.write_text(to_vrp_text(fetch(url), name))
+        except Exception as e:  # keep going, report at the end
+            print(f"  FAILED: {e}")
+            failed.append((name, url))
+    print("done — optima:", {n: o for n, _, o in INSTANCES})
+    if failed:
+        print("\nCould not download these — open the URL in a browser, save as "
+              "data/instances/<name>.vrp:")
+        for name, url in failed:
+            print(f"  {name}: {url}")
+        sys.exit(1)
+
+================================================================================
+src/model_milp.py
+================================================================================
+"""
+exact CVRP model (2-index formulation with MTZ constraints),
+solved with CBC through PuLP.
+
+x[i,j] = 1 if a vehicle drives directly from node i to node j.
+u[i]   = load on the vehicle after it visits customer i.
+The objective is the total distance travelled.
+"""
+
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+
+import re
+import tempfile
+
+import pulp
+
+sys.path.insert(0, str(Path(__file__).parent))
+import common #shared functions
+from common import Instance, Solution #input,output data structures
+from loader import load_cvrplib #functions for loading CVRP instances
+
+def build_model(inst: Instance):
+    """variables and objective (constraints added below)."""
+    nodes = range(inst.n_customers + 1) #0 is depot. 1..n customers
+    customers = list(inst.customers)
+    arcs = [(i,j) for i in nodes for j in nodes if i != j]
+
+    prob = pulp.LpProblem(f"CVRP_MTZ_{inst.name}", pulp.LpMinimize) #create empty minimization problem
+
+    #x[i,j]: binary variable: 1 if vehicle drives from i to j
+    x = prob.add_variable_dict("x_%s_%s", arcs, cat=pulp.LpBinary) #add binary variables for each arc
+    # u[i]: continuous load after customer i is visited (0 at depot, <= capacity at customers)
+    u = prob.add_variable_dict("u_%s", customers, cat=pulp.LpContinuous) #add continuous variables for each customer
+
+    #total distance travelled (objective)
+    prob += pulp.lpSum(int(inst.dist[i,j]) * x[i,j] for (i,j) in arcs)
+
+    Q = inst.capacity          # vehicle capacity
+    K = inst.n_vehicles        # fleet size
+    q = inst.demand            # q[i] = demand of node i
+
+    # C1: customer i has exactly one incoming arc (from depot or another customer)
+    for j in customers:
+        prob += pulp.lpSum(x[i, j] for i in nodes if i != j) == 1, f"C1_in_{j}"
+
+    # C2: customer i has exactly one outgoing arc (to depot or another customer)
+    for i in customers:
+        prob += pulp.lpSum(x[i, j] for j in nodes if j != i) == 1, f"C2_out_{i}"
+
+    # C3: at most K vehicles leave the depot, and all of them return
+    leave = pulp.lpSum(x[0, j] for j in customers)
+    enter = pulp.lpSum(x[i, 0] for i in customers)
+    prob += leave <= K, "C3_fleet"
+    prob += enter == leave, "C3_balance"
+
+    # C4 (MTZ): load increases along every arc between customers
+    for i in customers:
+        for j in customers:
+            if i != j:
+                prob += u[j] >= u[i] + int(q[j]) - Q * (1 - x[i, j]), f"C4_mtz_{i}_{j}"
+
+    # C5: load bounds
+    for i in customers:
+        prob += u[i] >= int(q[i]), f"C5_lo_{i}"
+        prob += u[i] <= Q, f"C5_hi_{i}"
+
+    return prob, x, u
+    
+def _read_lower_bound(log_path): #read the lower bound from the CBC log file (if it exists)
+    try:
+        text = Path(log_path).read_text() #read the log file
+    except OSError:
+        return None 
+    m = re.search(r"Lower bound:\s*([-+\d.eE]+)", text) #search for the line containing the lower bound
+    return float(m.group(1)) if m else None
+
+
+def _extract_routes(inst, x): #extract the routes from the solution variables x[i,j] (which are 0/1)
+    succ = {i: j for (i, j), var in x.items() if i != 0 and var.value() > 0.5}
+    routes = [] #list to store the extracted routes
+    for j in inst.customers: 
+        if x[0, j].value() > 0.5:
+            route = [j]
+            while succ[route[-1]] != 0: #follow the successor chain until we reach the depot (0)
+                route.append(succ[route[-1]])
+            routes.append(route)
+    return routes
+
+
+def solve(inst: Instance, time_limit: float = 300.0, seed: int = 0, **kw) -> Solution:
+    prob, x, u = build_model(inst)
+
+    # solve with CBC; the log goes to a temporary file so the bound can be read
+    with tempfile.TemporaryDirectory() as tmp: #create a temporary directory to store the log file
+        log_path = str(Path(tmp) / "cbc.log")
+        solver = pulp.COIN_CMD(msg=False, timeLimit=time_limit,
+                               randomSeed=seed, logPath=log_path)
+        t0 = time.perf_counter() #start the timer
+        stats = prob.solve(solver) 
+        runtime = time.perf_counter() - t0 #stop the timer and calculate the runtime
+        bound = stats.best_bound
+        if bound is None:
+            bound = _read_lower_bound(log_path)
+
+    # map the solver result to our status names
+    S = pulp.LpSolveStatus
+    if stats.status == S.Optimal:
+        status = "optimal"
+    elif stats.status == S.Infeasible:
+        status = "infeasible"
+    elif stats.status == S.TimeLimit:
+        status = "timeout"
+    else:
+        status = "feasible" if stats.has_solution else "infeasible"
+
+    # no solution found (e.g. time ran out before the first route set)
+    if not stats.has_solution:
+        return Solution(routes=[], cost=float("inf"), runtime=runtime,
+                        method="milp", status=status, bound=bound,
+                        extra={"seed": seed, "time_limit": time_limit})
+
+    routes = _extract_routes(inst, x) 
+    cost = common.solution_cost(inst, routes)
+    ok, why = common.is_feasible(inst, routes)
+    assert ok, f"MILP returned an infeasible solution: {why}"
+    if status == "optimal":
+        bound = cost  # optimum proved, so the bound equals the cost
+
+    return Solution(routes=routes, cost=cost, runtime=runtime, method="milp",
+                    status=status, bound=bound,
+                    extra={"seed": seed, "time_limit": time_limit,
+                           "solver_status": stats.status.name})
+
+
+if __name__ == "__main__": #solve a CVRP instance from the command line
+    path = sys.argv[1] if len(sys.argv) > 1 else "data/instances/P-n16-k8.vrp"
+    limit = float(sys.argv[2]) if len(sys.argv) > 2 else 120.0 #time limit in seconds
+    inst = load_cvrplib(path) #load the CVRP instance from the given path
+    sol = solve(inst, time_limit=limit) 
+    print(common.describe(inst, sol))
+    print(f"  lower bound = {sol.bound}") 
+
+
+================================================================================
+src/model_heuristic.py
+================================================================================
+"""
+model_heuristic.py - greedy + simulated annealing for the CVRP.
+
+greedy (nearest neighbour) gives the first routes, then SA improves them
+with relocate / swap / 2-opt moves. CVRP is NP-hard so MILP gets slow,
+this gives a good answer fast (no proof of optimal though).
+
+routes = list of customer ids, depot 0 not written (same as common.py).
+run: python src/model_heuristic.py data/instances/P-n16-k8.vrp
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+import common  # noqa: E402
+from common import Instance, Solution  # noqa: E402
+
+
+# ---- stage 1: greedy ----
+
+def greedy(inst: Instance) -> list[list[int]]:
+    """nearest customer that still fits, else back to depot and new truck"""
+    unvisited = set(inst.customers)
+    routes = []
+    while unvisited:
+        route, load, here = [], 0, 0          # new truck, empty, at depot
+        while True:
+            fits = [c for c in unvisited if load + inst.demand[c] <= inst.capacity]
+            if not fits:
+                break                         # full, go home
+            # closest one (tie -> smaller id)
+            nxt = min(fits, key=lambda c: (inst.dist[here, c], c))
+            route.append(nxt)
+            load += inst.demand[nxt]
+            unvisited.remove(nxt)
+            here = nxt
+        routes.append(route)
+    return routes
+
+
+# ---- stage 2: moves ----
+# each move returns NEW routes (input not changed), None if a truck overloads
+
+def relocate(inst: Instance, routes, r1: int, i: int, r2: int, j: int):
+    """move customer i of route r1 to position j of route r2"""
+    new = [list(r) for r in routes]
+    customer = new[r1].pop(i)
+    new[r2].insert(j, customer)
+    # only r2 got heavier so only check r2
+    if r1 != r2 and common.route_load(inst, new[r2]) > inst.capacity:
+        return None
+    return [r for r in new if r]              # drop empty route (1 truck less)
+
+
+def swap(inst: Instance, routes, r1: int, i: int, r2: int, j: int):
+    """swap 2 customers on different routes"""
+    if r1 == r2:
+        return None
+    new = [list(r) for r in routes]
+    new[r1][i], new[r2][j] = new[r2][j], new[r1][i]
+    # both loads change -> check both
+    if (common.route_load(inst, new[r1]) > inst.capacity
+            or common.route_load(inst, new[r2]) > inst.capacity):
+        return None
+    return new
+
+
+def two_opt(inst: Instance, routes, r: int, i: int, j: int):
+    """reverse route r from i to j, removes a crossing. same load so no check"""
+    new = [list(rt) for rt in routes]
+    new[r][i:j + 1] = reversed(new[r][i:j + 1])
+    return new
+
+
+def random_move(inst: Instance, routes, rng: random.Random):
+    """pick a random move with random positions"""
+    move = rng.choice(("relocate", "swap", "two_opt"))
+    r1 = rng.randrange(len(routes))
+    i = rng.randrange(len(routes[r1]))
+
+    if move == "relocate":
+        r2 = rng.randrange(len(routes))
+        # r1 is 1 shorter after pop
+        size = len(routes[r2]) - 1 if r2 == r1 else len(routes[r2])
+        j = rng.randint(0, size)
+        if r1 == r2 and i == j:
+            return None                       # same spot, nothing changes
+        return relocate(inst, routes, r1, i, r2, j)
+
+    if move == "swap":
+        if len(routes) < 2:
+            return None
+        r2 = rng.randrange(len(routes))
+        j = rng.randrange(len(routes[r2]))
+        return swap(inst, routes, r1, i, r2, j)
+
+    # 2-opt needs 2+ customers
+    if len(routes[r1]) < 2:
+        return None
+    a, b = sorted(rng.sample(range(len(routes[r1])), 2))
+    return two_opt(inst, routes, r1, a, b)
+
+
+# ---- stage 3: simulated annealing ----
+
+def objective(inst: Instance, routes, penalty: float) -> float:
+    """distance + penalty if more routes than trucks (K).
+    penalty = load left on the lightest extra route, so moving customers off
+    it lowers the penalty step by step. 0 when routes <= K"""
+    extra_routes = len(routes) - inst.n_vehicles
+    if extra_routes <= 0:
+        return common.solution_cost(inst, routes)
+    loads = sorted(common.route_load(inst, r) for r in routes)
+    return common.solution_cost(inst, routes) + penalty * sum(loads[:extra_routes])
+
+
+def initial_temperature(inst: Instance, routes, penalty: float, rng: random.Random,
+                        samples: int = 100) -> float:
+    """T0 = avg |delta| of 100 random moves (avg bad move accepted ~37% at start)"""
+    start = objective(inst, routes, penalty)
+    deltas = []
+    while len(deltas) < samples:
+        new = random_move(inst, routes, rng)
+        if new is not None:                   # skip overloaded ones
+            deltas.append(abs(objective(inst, new, penalty) - start))
+    return sum(deltas) / len(deltas)
+
+
+def solve(inst: Instance, time_limit: float = 300.0, seed: int = 0, T0: float | None = None,
+          alpha: float = 0.995, iters_per_temp: int | None = None,
+          T_min: float = 0.01, **kw) -> Solution:
+    """SA from the greedy routes.
+    better move -> always take. worse by delta -> take with prob exp(-delta/T)
+    (this is how it gets out of local optima). T *= alpha every iters_per_temp
+    moves. stop when T < T_min or time is up. return best, not current"""
+    start_time = time.perf_counter()
+    rng = random.Random(seed)                 # same seed = same run
+    penalty = float(inst.dist.max())
+
+    start_routes = greedy(inst)
+    current, current_cost = start_routes, objective(inst, start_routes, penalty)
+    # best only counts plans with <= K trucks
+    best, best_cost = None, math.inf
+    if len(current) <= inst.n_vehicles:
+        best, best_cost = current, current_cost
+
+    T = T0 if T0 is not None else initial_temperature(inst, current, penalty, rng)
+    start_T = T
+    if iters_per_temp is None:
+        iters_per_temp = 10 * inst.n_customers  # bigger problem, more tries per T
+
+    history = []                              # best cost each iteration (for the plot)
+    iterations = 0
+    while T > T_min and time.perf_counter() - start_time < time_limit:
+        for _ in range(iters_per_temp):
+            iterations += 1
+            new = random_move(inst, current, rng)
+            if new is not None:
+                new_cost = objective(inst, new, penalty)
+                delta = new_cost - current_cost
+                # accept rule
+                if delta <= 0 or rng.random() < math.exp(-delta / T):
+                    current, current_cost = new, new_cost
+                    if len(current) <= inst.n_vehicles and current_cost < best_cost:
+                        best, best_cost = current, current_cost
+            history.append(best_cost)
+        T *= alpha                            # cool down
+
+    assert best is not None, "SA never found a plan that fits in K trucks"
+    ok, why = common.is_feasible(inst, best)
+    assert ok, f"SA returned an infeasible solution: {why}"
+    return Solution(
+        routes=best,
+        cost=common.solution_cost(inst, best),
+        runtime=time.perf_counter() - start_time,
+        method="sa",
+        status="feasible",
+        extra={"seed": seed, "T0": start_T, "alpha": alpha, "iters_per_temp": iters_per_temp,
+               "iterations": iterations, "greedy_cost": common.solution_cost(inst, start_routes),
+               "history": history},
+    )
+
+
+if __name__ == "__main__":
+    from loader import load_cvrplib
+
+    path = sys.argv[1] if len(sys.argv) > 1 else "data/instances/P-n16-k8.vrp"
+    inst = load_cvrplib(path)
+
+    routes = greedy(inst)
+    print("Greedy:", common.solution_cost(inst, routes), "|", common.is_feasible(inst, routes))
+
+    sol = solve(inst, seed=0)
+    print(common.describe(inst, sol))
+    print(f"T0={sol.extra['T0']:.1f}  iterations={sol.extra['iterations']:,}  "
+          f"greedy={sol.extra['greedy_cost']:.0f}")
+
+================================================================================
+src/evaluate.py
+================================================================================
+"""
+evaluate.py - runs MILP and SA on all instances, saves results/results.csv
+
+one row per run. cost is recomputed here with common.solution_cost so both
+methods are scored the same way. synthetic n=10,20,40,80 = scalability study
+(where does the MILP break?).
+
+    python src/evaluate.py --quick     # only P-n16-k8 -> results/results_quick.csv
+    python src/evaluate.py --full      # everything (MILP takes long)
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import statistics
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+import common  # noqa: E402
+import loader  # noqa: E402
+import model_heuristic  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
+INSTANCE_DIR = ROOT / "data" / "instances"
+RESULTS_CSV = ROOT / "results" / "results.csv"
+QUICK_CSV = ROOT / "results" / "results_quick.csv"   # quick test goes here, not over the real one
+COLUMNS = ["instance", "n", "method", "seed", "cost", "optimum", "gap_pct",
+           "runtime_s", "status", "bound"]
+
+
+def load_milp():
+    """Nisal's model_milp.solve, or None if not there"""
+    try:
+        import model_milp
+        return model_milp.solve
+    except (ImportError, AttributeError):
+        print("MILP not ready yet (model_milp.solve missing) - running SA only.\n")
+        return None
+
+
+def make_row(inst, sol, seed):
+    """one csv row. no routes (MILP found nothing) -> keep cost inf, not 0"""
+    cost = common.solution_cost(inst, sol.routes) if sol.routes else sol.cost
+    gap = sol.gap_to(inst.optimum) if sol.routes else None
+    return {
+        "instance": inst.name, "n": inst.n_customers, "method": sol.method,
+        "seed": seed, "cost": cost, "optimum": inst.optimum,
+        "gap_pct": None if gap is None else round(gap, 2),
+        "runtime_s": round(sol.runtime, 3), "status": sol.status, "bound": sol.bound,
+    }
+
+
+def run(quick: bool):
+    milp_solve = load_milp()
+    seeds = [0] if quick else [0, 1, 2, 3, 4]
+    sa_limit, milp_limit = (10, 60) if quick else (60, 600)
+
+    # cvrplib ones (known optimum)
+    paths = [INSTANCE_DIR / "P-n16-k8.vrp"] if quick else sorted(INSTANCE_DIR.glob("*.vrp"))
+    benchmarks = sorted((loader.load_cvrplib(p) for p in paths), key=lambda i: i.n_customers)
+    # random ones, growing size
+    synthetic = [] if quick else [loader.generate_synthetic(n, seed=0) for n in (10, 20, 40, 80)]
+
+    rows = []
+    for inst in benchmarks + synthetic:
+        if milp_solve is not None:
+            sol = milp_solve(inst, time_limit=milp_limit)   # milp once
+            rows.append(make_row(inst, sol, seed=None))
+            print(f"{inst.name:18s} milp  cost={rows[-1]['cost']:8.0f}  {sol.status}  "
+                  f"{sol.runtime:7.1f}s", flush=True)
+        for seed in seeds:                                  # sa 5 times (random)
+            sol = model_heuristic.solve(inst, time_limit=sa_limit, seed=seed)
+            rows.append(make_row(inst, sol, seed))
+            print(f"{inst.name:18s} sa    cost={rows[-1]['cost']:8.0f}  seed={seed}  "
+                  f"{sol.runtime:7.1f}s", flush=True)
+    return rows
+
+
+def save(rows, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"\nSaved {len(rows)} rows to {path.relative_to(ROOT)}")
+
+
+def print_summary(rows):
+    """mean +- std per instance and method"""
+    groups = {}
+    for r in rows:
+        groups.setdefault((r["n"], r["instance"], r["method"]), []).append(r)
+    print(f"\n{'instance':18s} {'method':6s} {'runs':>4s} {'cost mean +- std':>18s} "
+          f"{'gap %':>7s} {'time s':>8s}")
+    for (_, name, method), group in sorted(groups.items()):
+        costs = [r["cost"] for r in group]
+        std = statistics.stdev(costs) if len(costs) > 1 else 0.0
+        gap = "-" if group[0]["gap_pct"] is None else f"{statistics.mean(r['gap_pct'] for r in group):.2f}"
+        time_s = statistics.mean(r["runtime_s"] for r in group)
+        print(f"{name:18s} {method:6s} {len(group):4d} {statistics.mean(costs):10.1f} +- {std:5.1f} "
+              f"{gap:>7s} {time_s:8.2f}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the MILP and SA on all instances.")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--quick", action="store_true", help="P-n16-k8 only, short time limits")
+    mode.add_argument("--full", action="store_true", help="all instances, full time limits")
+    args = parser.parse_args()
+
+    results = run(quick=args.quick)
+    save(results, QUICK_CSV if args.quick else RESULTS_CSV)
+    print_summary(results)
+
+================================================================================
+src/plots.py
+================================================================================
+"""
+plots.py - all figures for the results section (from results/results.csv)
+
+    cost_comparison.png    optimum vs MILP vs SA cost per instance
+    runtime_vs_n.png       runtime vs n (log scale)
+    gap_vs_n.png           gap to optimum vs n (SA mean +- std)
+    sa_convergence.png     SA best cost per iteration, A-n32-k5 seed 0
+    routes_<name>.png      route map, 1 colour per truck
+
+each function returns the fig so notebooks can show it.
+plot_routes(inst, sol) works for MILP and SA solutions.
+
+    python src/plots.py
+"""
+
+from __future__ import annotations
+
+import csv
+import statistics
+import sys
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+
+sys.path.insert(0, str(Path(__file__).parent))
+import common  # noqa: E402
+import loader  # noqa: E402
+import model_heuristic  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
+RESULTS_CSV = ROOT / "results" / "results.csv"
+FIGURES = ROOT / "results" / "figures"
+COLOURS = {"sa": "#2a78d6", "milp": "#eb6834", "optimum": "#555555"}
+LABELS = {"sa": "Simulated annealing (mean of seeds)", "milp": "MILP (exact)",
+          "optimum": "Proven optimum"}
+ROUTE_COLOURS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4",
+                 "#008300", "#4a3aa7", "#e34948", "#7a7a7a", "#00a3b4"]
+
+
+def read_results(path=RESULTS_CSV):
+    with open(path) as f:
+        return list(csv.DictReader(f))
+
+
+def group_by_instance(rows, method):
+    """{n: rows} for one method, sorted by n"""
+    groups = {}
+    for r in rows:
+        if r["method"] == method:
+            groups.setdefault(int(r["n"]), []).append(r)
+    return dict(sorted(groups.items()))
+
+
+def save(fig, name):
+    FIGURES.mkdir(parents=True, exist_ok=True)
+    fig.savefig(FIGURES / name, dpi=200, bbox_inches="tight")
+    print(f"saved results/figures/{name}")
+    return fig
+
+
+def plot_routes(inst, sol, filename=None):
+    """route map: depot, customers, each truck own colour (MILP or SA sol)"""
+    fig, ax = plt.subplots(figsize=(7, 7))
+    depot = inst.coords[0]
+    for k, route in enumerate(sol.routes):
+        path = [depot] + [inst.coords[c] for c in route] + [depot]
+        xs, ys = zip(*path)
+        load = common.route_load(inst, route)
+        ax.plot(xs, ys, color=ROUTE_COLOURS[k % len(ROUTE_COLOURS)], linewidth=2,
+                label=f"Route {k + 1} (load {load}/{inst.capacity})")
+    ax.scatter(inst.coords[1:, 0], inst.coords[1:, 1], color="black", s=20, zorder=3)
+    ax.scatter(*depot, color="red", marker="s", s=100, zorder=4, label="Depot")
+    ax.set_title(f"{inst.name}: {sol.method.upper()} routes, cost {sol.cost:.0f}")
+    ax.set_aspect("equal")
+    ax.legend(loc="center left", bbox_to_anchor=(1, 0.5))
+    return save(fig, filename or f"routes_{inst.name}_{sol.method}.png")
+
+
+def cost_comparison(rows):
+    """bars per instance: optimum, MILP cost, SA mean cost"""
+    names, optimum, milp, sa = [], [], [], []
+    for n, group in group_by_instance(rows, "sa").items():
+        if not group[0]["optimum"]:
+            continue                                   # synthetic has no optimum, skip
+        name = group[0]["instance"]
+        names.append(name)
+        optimum.append(float(group[0]["optimum"]))
+        sa.append(statistics.mean(float(r["cost"]) for r in group))
+        m = [r for r in rows if r["method"] == "milp" and r["instance"] == name]
+        milp.append(float(m[0]["cost"]) if m and m[0]["cost"] != "inf" else 0.0)
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    xs = range(len(names))
+    width = 0.27
+    ax.bar([x - width for x in xs], optimum, width, color=COLOURS["optimum"], label=LABELS["optimum"])
+    if any(milp):
+        ax.bar(list(xs), milp, width, color=COLOURS["milp"], label=LABELS["milp"])
+        for x, c in zip(xs, milp):
+            if c == 0:                                 # milp found nothing in time
+                ax.text(x, 50, "MILP: no\nsolution\nin 600 s", ha="center", fontsize=8,
+                        color=COLOURS["milp"])
+    ax.bar([x + width for x in xs], sa, width, color=COLOURS["sa"], label=LABELS["sa"])
+    ax.set_xticks(list(xs))
+    ax.set_xticklabels(names)
+    ax.set_ylabel("Total distance")
+    ax.set_title("Cost on the benchmark instances (lower is better)")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend()
+    return save(fig, "cost_comparison.png")
+
+
+def runtime_vs_n(rows):
+    """mean runtime vs n, log y, 1 line per method"""
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for method in ("milp", "sa"):
+        groups = group_by_instance(rows, method)
+        if not groups:
+            continue
+        ns = list(groups)
+        times = [statistics.mean(float(r["runtime_s"]) for r in g) for g in groups.values()]
+        ax.plot(ns, times, marker="o", color=COLOURS[method], label=LABELS[method])
+    ax.set_yscale("log")
+    ax.set_xlabel("Number of customers n")
+    ax.set_ylabel("Runtime (s, log scale)")
+    ax.set_title("Runtime against problem size")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return save(fig, "runtime_vs_n.png")
+
+
+def gap_vs_n(rows):
+    """gap to optimum vs n, SA with std error bars"""
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for method in ("milp", "sa"):
+        groups = {n: g for n, g in group_by_instance(rows, method).items() if g[0]["gap_pct"]}
+        if not groups:
+            continue
+        ns = list(groups)
+        gaps = [[float(r["gap_pct"]) for r in g] for g in groups.values()]
+        means = [statistics.mean(g) for g in gaps]
+        stds = [statistics.stdev(g) if len(g) > 1 else 0.0 for g in gaps]
+        ax.errorbar(ns, means, yerr=stds, marker="o", capsize=4,
+                    color=COLOURS[method], label=LABELS[method])
+    ax.set_xlabel("Number of customers n")
+    ax.set_ylabel("Gap to optimum (%)")
+    ax.set_title("Solution quality against problem size")
+    ax.set_ylim(bottom=0)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return save(fig, "gap_vs_n.png")
+
+
+def sa_convergence(inst, sol):
+    """best cost per iteration + optimum line"""
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(sol.extra["history"], color=COLOURS["sa"], label="SA best cost so far")
+    if inst.optimum:
+        ax.axhline(inst.optimum, color="black", linewidth=1, linestyle="--",
+                   label=f"Optimum ({inst.optimum})")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Total distance")
+    ax.set_title(f"SA convergence on {inst.name} (seed {sol.extra['seed']})")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return save(fig, "sa_convergence.png")
+
+
+if __name__ == "__main__":
+    rows = read_results()
+    cost_comparison(rows)
+    runtime_vs_n(rows)
+    gap_vs_n(rows)
+
+    # 1 SA run -> convergence plot + route map
+    inst = loader.load_cvrplib(ROOT / "data" / "instances" / "A-n32-k5.vrp")
+    sol = model_heuristic.solve(inst, seed=0)
+    sa_convergence(inst, sol)
+    plot_routes(inst, sol)
+
+================================================================================
+src/tuning.py
+================================================================================
+"""
+tuning.py - small SA parameter test on A-n32-k5 (opt 784)
+
+change one thing at a time, 5 seeds each:
+    alpha: 0.95, 0.99, 0.995 (default), 0.999
+    T0: 0.5x, 1x, 2x the auto value
+saves results/tuning.csv + results/figures/tuning.png
+used to justify alpha=0.995 and auto T0 in the report.
+
+    python src/tuning.py
+"""
+
+from __future__ import annotations
+
+import csv
+import statistics
+import sys
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+
+sys.path.insert(0, str(Path(__file__).parent))
+import loader  # noqa: E402
+import model_heuristic  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
+INSTANCE = ROOT / "data" / "instances" / "A-n32-k5.vrp"
+SEEDS = [0, 1, 2, 3, 4]
+ALPHAS = [0.95, 0.99, 0.995, 0.999]
+T0_FACTORS = [0.5, 1.0, 2.0]
+
+
+def run_setting(inst, parameter, value, **kw):
+    """run SA for every seed with these settings"""
+    rows = []
+    for seed in SEEDS:
+        sol = model_heuristic.solve(inst, seed=seed, **kw)
+        rows.append({"parameter": parameter, "value": value, "seed": seed, "cost": sol.cost,
+                     "gap_pct": round(sol.gap_to(inst.optimum), 2),
+                     "runtime_s": round(sol.runtime, 2)})
+    costs = [r["cost"] for r in rows]
+    print(f"{parameter:6s} {value:>6}  mean cost {statistics.mean(costs):7.1f}  "
+          f"best {min(costs):5.0f}  time {statistics.mean(r['runtime_s'] for r in rows):5.1f}s", flush=True)
+    return rows
+
+
+def main():
+    inst = loader.load_cvrplib(INSTANCE)
+    rows = []
+
+    # 1. alpha only, rest default
+    for alpha in ALPHAS:
+        rows += run_setting(inst, "alpha", alpha, alpha=alpha)
+
+    # 2. T0 only. fixed T0 for all seeds = factor x auto T0 of seed 0
+    #    (so 1.0x is close to the alpha 0.995 row but not exactly same)
+    auto_T0 = model_heuristic.solve(inst, seed=0).extra["T0"]
+    for factor in T0_FACTORS:
+        rows += run_setting(inst, "T0", factor, T0=factor * auto_T0)
+
+    out = ROOT / "results" / "tuning.csv"
+    with open(out, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"saved {out.relative_to(ROOT)}")
+    plot(rows, auto_T0)
+
+
+def plot(rows, auto_T0):
+    """2 panels: gap mean +- std for each alpha / each T0"""
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    for ax, parameter, values, label in [
+            (axes[0], "alpha", ALPHAS, "cooling rate alpha"),
+            (axes[1], "T0", T0_FACTORS, f"T0 as a multiple of the automatic value ({auto_T0:.0f})")]:
+        gaps = [[r["gap_pct"] for r in rows if r["parameter"] == parameter and r["value"] == v]
+                for v in values]
+        times = [statistics.mean(r["runtime_s"] for r in rows
+                                 if r["parameter"] == parameter and r["value"] == v) for v in values]
+        xs = range(len(values))
+        ax.errorbar(xs, [statistics.mean(g) for g in gaps], yerr=[statistics.stdev(g) for g in gaps],
+                    marker="o", capsize=4, color="#2a78d6")
+        ax.set_xticks(list(xs))
+        ax.set_xticklabels([f"{v}\n({t:.1f} s)" for v, t in zip(values, times)])
+        ax.set_xlabel(label + "   (mean runtime in brackets)")
+        ax.set_ylabel("Gap to optimum (%)")
+        ax.set_ylim(bottom=0)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle("SA sensitivity on A-n32-k5 (5 seeds per setting, mean ± std)")
+    fig.tight_layout()
+    path = ROOT / "results" / "figures" / "tuning.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    print(f"saved {path.relative_to(ROOT)}")
+
+
+if __name__ == "__main__":
+    main()
+
