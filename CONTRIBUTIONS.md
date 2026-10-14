@@ -39,3 +39,37 @@ Pull requests: #1, #2, #3, #4, #7, #8.
 
 ## Ayesh Lakshan (MS26901626)
 
+I worked on the heuristic method, the experiments and the figures.
+
+**Heuristic method**
+
+- `src/model_heuristic.py`: a capacity-aware nearest-neighbour greedy
+  construction, and simulated annealing that improves it with three moves
+  (relocate, swap and 2-opt). Every move checks capacity with
+  `common.route_load`, and every cost comes from `common.solution_cost`.
+- SA details: start temperature from the average change of 100 random moves,
+  geometric cooling (T = 0.995 T), keeping the best plan separately from the
+  current one, and a penalty that empties an extra route when greedy uses more
+  trucks than allowed (needed for A-n45-k6).
+- `solve(inst, time_limit, seed)` follows the same interface as the MILP, so
+  both methods can be run the same way.
+
+**Experiments and results**
+
+- `src/evaluate.py`: runs the MILP (600 s) and SA (5 seeds) on the five
+  benchmark instances and on synthetic instances with 10, 20, 40 and 80
+  customers (scalability study), and writes `results/results.csv`.
+- `src/tuning.py`: a small sensitivity study of the cooling rate and the start
+  temperature, saved in `results/tuning.csv`.
+- `src/plots.py`: the result figures (cost comparison, runtime and gap against
+  size, SA convergence) and `plot_routes()`, which draws the routes of either
+  method and is also used in `main.ipynb`.
+
+**Notebook, report and video**
+
+- `notebooks/heuristic_method.ipynb`: SA on three instances with the
+  convergence plot and a route map.
+- Report sections 5 to 7 (heuristic method, results, discussion and future
+  work), and video minutes 7:30 to 15:00.
+
+Pull requests: #5, #6.
